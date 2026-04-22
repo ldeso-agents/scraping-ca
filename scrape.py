@@ -202,15 +202,15 @@ def scrape_brand_page(holder, brand_path):
     return company_name, company_website
 
 
-def load_existing_dates(filepath):
-    dates = {}
+def load_existing_rows(filepath):
+    rows = {}
     try:
         with open(filepath, newline="") as f:
             for row in csv.DictReader(f):
-                dates[row["company_name"]] = row["date_added"]
+                rows[row["company_name"]] = row
     except FileNotFoundError:
         pass
-    return dates
+    return rows
 
 
 def main():
@@ -240,6 +240,7 @@ def main():
                         "date_added": today,
                         "company_name": name,
                         "company_website": website,
+                        "date_removed": "",
                     }
                 )
             else:
@@ -247,17 +248,32 @@ def main():
         except Exception as e:
             _log(f"  Error: {e}")
 
-    companies.sort(key=lambda c: c["company_name"].lower())
+    existing_rows = load_existing_rows(OUTPUT_FILE)
+    scraped_names = {c["company_name"] for c in companies}
 
-    existing_dates = load_existing_dates(OUTPUT_FILE)
     for company in companies:
-        original = existing_dates.get(company["company_name"])
-        if original:
-            company["date_added"] = original
+        existing = existing_rows.get(company["company_name"])
+        if existing and existing.get("date_added"):
+            company["date_added"] = existing["date_added"]
+
+    for name, existing in existing_rows.items():
+        if name in scraped_names:
+            continue
+        companies.append(
+            {
+                "date_added": existing.get("date_added", ""),
+                "company_name": name,
+                "company_website": existing.get("company_website", ""),
+                "date_removed": existing.get("date_removed") or today,
+            }
+        )
+
+    companies.sort(key=lambda c: c["company_name"].lower())
 
     with open(OUTPUT_FILE, "w", newline="") as f:
         writer = csv.DictWriter(
-            f, fieldnames=["date_added", "company_name", "company_website"]
+            f,
+            fieldnames=["date_added", "company_name", "company_website", "date_removed"],
         )
         writer.writeheader()
         writer.writerows(companies)
