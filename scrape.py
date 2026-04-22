@@ -8,10 +8,11 @@ times headless browsers from cloud IP ranges).
 
 import csv
 import datetime
-import re
+import html
+import json
 import sys
 import time
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests as cc_requests
@@ -22,7 +23,6 @@ OUTPUT_FILE = "companies.csv"
 
 IMPERSONATE = "chrome"
 REQUEST_TIMEOUT = 60
-MAX_PAGES = 60
 RETRY_DELAYS = (2, 4, 8, 16)
 
 SOCIAL_MEDIA_DOMAINS = [
@@ -36,13 +36,6 @@ SOCIAL_MEDIA_DOMAINS = [
     "x.com",
     "threads.net",
 ]
-
-BRAND_PATH_RE = re.compile(r"^/buy-climate-active/certified-members/[^/?#]+/?$")
-
-# Labels the original Playwright scraper looked for on "Load more" buttons.
-# We match the same strings on anchor text as a fallback for sites that ship a
-# JS-disabled link alongside the button.
-LOAD_MORE_LABELS = ("Load more", "Show more", "See more", "View more")
 
 
 def _log(msg):
@@ -97,82 +90,35 @@ def fetch(session, url, *, context):
     raise RuntimeError(f"GET {url} failed after retries: {last_exc!r}")
 
 
-def _normalise_href(href):
-    if not href:
-        return None
-    parsed = urlparse(href)
-    if parsed.netloc and parsed.netloc not in (urlparse(BASE_URL).netloc, ""):
-        return None
-    path = parsed.path
-    if not BRAND_PATH_RE.match(path):
-        return None
-    return path.rstrip("/")
+def collect_brand_urls(session):
+    """Fetch the directory page and extract brand paths from its JSON payload.
 
+    The listing page renders its cards client-side from a JSON blob on
+    `div.certified-brands-list[data-model]`; the server HTML has no
+    per-brand anchors, so we parse that JSON directly.
+    """
+    _log(f"Fetching directory page: {LISTING_URL}")
+    resp = fetch(session, LISTING_URL, context="directory page")
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-def _extract_brand_paths(soup):
+    container = soup.select_one("div.certified-brands-list[data-model]")
+    if not container:
+        raise RuntimeError(
+            "certified-brands-list[data-model] not found on directory page"
+        )
+
+    data = json.loads(html.unescape(container["data-model"]))
+    brands = data.get("certifiedBrands", [])
+
     paths = set()
-    for a in soup.select('a[href*="/buy-climate-active/certified-members/"]'):
-        path = _normalise_href(a.get("href"))
+    for brand in brands:
+        url = (brand.get("link") or {}).get("url") or ""
+        path = urlparse(url).path.rstrip("/")
         if path:
             paths.add(path)
-    return paths
 
-
-def _find_next_url(soup, current_url):
-    """Find the URL of the next batch of brands.
-
-    Tries, in order: rel=next pager links, the Drupal pager next link, and
-    any anchor whose visible text matches a "Load more"-style label. The
-    original Playwright scraper advanced by clicking buttons with those
-    labels; here we follow whichever URL the equivalent anchor exposes.
-    """
-    link = soup.find("a", attrs={"rel": "next"})
-    if not link:
-        link = soup.select_one("li.pager__item--next a")
-    if not link:
-        for a in soup.find_all("a", href=True):
-            text = a.get_text(" ", strip=True).lower()
-            if text and any(label.lower() in text for label in LOAD_MORE_LABELS):
-                link = a
-                break
-    if not link or not link.get("href"):
-        return None
-    return urljoin(current_url, link["href"])
-
-
-def collect_brand_urls(session):
-    """Walk the directory and collect every brand URL.
-
-    Mirrors the original Playwright loop: keep advancing to the next batch
-    until either no next-page link can be found or the total brand count
-    stops growing (the count-plateau termination from the JS scroll/Load
-    more loop). Capped at MAX_PAGES iterations.
-    """
-    all_paths = set()
-    url = LISTING_URL
-
-    for page_num in range(1, MAX_PAGES + 1):
-        _log(f"Fetching directory page {page_num}: {url}")
-        resp = fetch(session, url, context=f"directory page {page_num}")
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        new_paths = _extract_brand_paths(soup)
-        if not new_paths and page_num == 1:
-            _log("  WARNING: no brand links on first page — selector may be stale.")
-            _log(f"  body[:2k] : {resp.text[:2000]}")
-        added = len(new_paths - all_paths)
-        all_paths |= new_paths
-        _log(f"  found {len(new_paths)} brand links on this page ({added} new, {len(all_paths)} total)")
-
-        if page_num > 1 and added == 0:
-            break
-
-        next_url = _find_next_url(soup, resp.url)
-        if not next_url or next_url == url:
-            break
-        url = next_url
-
-    return sorted(all_paths)
+    _log(f"  parsed {len(brands)} brand entries, {len(paths)} unique paths")
+    return sorted(paths)
 
 
 def _looks_like_domain(text):
